@@ -1,0 +1,166 @@
+variables:
+  GITLAB_REGISTRY: [your-gitlab-registry:port]
+stages:
+  - compile
+  - build
+  - test
+  - deploy
+
+# Compile template. Please do not make any changes here.
+.compile_template: &compile_template_definition
+  image: ${IMAGE}
+  stage: compile
+  only:
+    refs:
+      - master
+      - develop
+  script:
+    - mkdir -p ./out/$PROJECT
+    - dotnet restore ${PROJECT}/${PROJECT}.csproj
+    - dotnet build ${PROJECT}/${PROJECT}.csproj -c Release -o ./out/$PROJECT
+    - ls ./out/$PROJECT
+  artifacts:
+    name: "compile-$CI_PROJECT_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - ./out/$PROJECT
+    expire_in: 1 week
+
+
+# Build template. Please do not make any changes here.
+
+.build_template: &build_template_definition
+  image: docker:git
+  stage: build
+  only:
+    refs:
+      - tags
+      - master
+      - develop
+  services:
+    - docker:dind
+  before_script:
+    - docker login ${GITLAB_REGISTRY} -u ${REGISTRY_USERNAME} -p ${REGISTRY_PASSWORD}
+  script:
+    - docker build --build-arg PROJECT=${PROJECT} -t ${GITLAB_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_PROJECT}-${CI_COMMIT_REF_SLUG} .
+    - docker push ${GITLAB_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_PROJECT}-${CI_COMMIT_REF_SLUG}
+
+# Test template. Please do not make any changes here.
+
+.test_template: &test_template_definition
+  image: ${IMAGE}
+  stage: test
+  only:
+    refs:
+      - tags
+      - master
+      - develop
+  script:
+    - cd ${PROJECT}
+    - dotnet test --configuration Release --no-build --verbosity normal
+
+
+# Deploy template. Please do not make any changes here.
+
+.deploy_template: &deploy_template_definition
+  image: ubuntu:latest
+  stage: deploy
+  dependencies: []
+  before_script:
+    - apt update
+    - apt install openssh-client -y
+    - mkdir -p ~/.ssh
+    - echo "$PRIVATE_KEY" > ~/.ssh/id_rsa
+    - chmod 600 ~/.ssh/id_rsa
+    - eval "$(ssh-agent -s)"
+    - ssh-add ~/.ssh/id_rsa
+    - ssh-keyscan -p ${SERVER_SSH_PORT} -H ${SERVER_SSH_HOST} >> ~/.ssh/known_hosts
+    - ssh ${SERVER_SSH_USER}@${SERVER_SSH_HOST} -p ${SERVER_SSH_PORT} "docker login ${GITLAB_REGISTRY} -u ${REGISTRY_USERNAME} -p ${REGISTRY_PASSWORD}"
+  script:
+    - ssh ${SERVER_SSH_USER}@${SERVER_SSH_HOST} -p ${SERVER_SSH_PORT} "docker pull ${GITLAB_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_PROJECT}-${CI_COMMIT_REF_SLUG}"
+    - ssh ${SERVER_SSH_USER}@${SERVER_SSH_HOST} "docker stop ${CI_PROJECT} || true; docker rm ${CI_PROJECT} || true"
+    - ssh ${SERVER_SSH_USER}@${SERVER_SSH_HOST} -p ${SERVER_SSH_PORT} "docker run -t -d
+      --name=${CI_PROJECT}
+      -p ${INTERNAL_PORT}:80
+      --log-driver json-file --log-opt max-size=10m
+      --restart=always
+      ${GITLAB_REGISTRY}/${CI_PROJECT_NAMESPACE}/${CI_PROJECT_NAME}:${CI_PROJECT}-${CI_COMMIT_REF_SLUG}"
+
+
+# Please duplicate the compile section for each project and replace the placeholder values with the appropriate ones.
+compile:[PROJECT_NAME]:
+  <<: *compile_template_definition
+  variables:
+    PROJECT: [PROJECT_NAME]
+    IMAGE: "[IMAGE_NAME]"
+
+# Please duplicate the build section for each project and replace the placeholder values with the appropriate ones.
+build:[PROJECT_NAME]:
+  <<: *build_template_definition
+  variables:
+    PROJECT: [PROJECT_NAME]
+    CI_PROJECT: [CI_PROJECT_NAME]
+  dependencies:
+    - compile:[PROJECT_NAME]
+
+# Please duplicate the test section for each project and replace the placeholder values with the appropriate ones.
+test:[PROJECT_NAME]:
+  <<: *test_template_definition
+  dependencies:
+    - build:[PROJECT_NAME]
+  variables:
+    IMAGE: [IMAGE_NAME]
+    PROJECT: [PROJECT_NAME]
+
+# Please deploy only tags to the first production server. If the project is not designed to use tags, you can add the master branch as well.
+deploy:[PROJECT_NAME]:production:s1:
+  <<: *deploy_template_definition
+  only:
+    - tags
+  except:
+    - branches
+  dependencies:
+    - test:[PROJECT_NAME]
+  variables:
+    ENVIROMENT: production
+    PROJECT: [PROJECT_NAME]
+    CI_PROJECT: [CI_PROJECT_NAME]
+    INTERNAL_PORT: [INTERNAL_PORT]
+    SERVER_SSH_USER: "root"
+    SERVER_SSH_HOST: [PRODOCTION_1_IP]
+    SERVER_SSH_PORT: "22"
+
+# Please deploy only tags to the second production server. If the project is not designed to use tags, you can add the master branch as well.
+deploy:[PROJECT_NAME]:production:s2:
+  <<: *deploy_template_definition
+  only:
+    - tags
+  except:
+    - branches
+  dependencies:
+    - test:[PROJECT_NAME]
+  variables:
+    ENVIROMENT: production
+    PROJECT: [PROJECT_NAME]
+    CI_PROJECT: [CI_PROJECT_NAME]
+    INTERNAL_PORT: [INTERNAL_PORT]
+    SERVER_SSH_USER: "root"
+    SERVER_SSH_HOST: [PRODOCTION_2_IP]
+    SERVER_SSH_PORT: "22"
+
+
+# Please deploy only the "develop" branch to the staging server. If the project does not need to be staged, please comment out this section.
+deploy:[PROJECT_NAME]:staging:
+  <<: *deploy_template_definition
+  only:
+    refs:
+      - develop
+  dependencies:
+    - test:[PROJECT_NAME]
+  variables:
+    ENVIROMENT: staging
+    PROJECT: [PROJECT_NAME]
+    CI_PROJECT: [CI_PROJECT_NAME]
+    INTERNAL_PORT: [INTERNAL_PORT]
+    SERVER_SSH_USER: "root"
+    SERVER_SSH_HOST: [STAGING_IP]
+    SERVER_SSH_PORT: "22"
